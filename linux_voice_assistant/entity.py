@@ -2,7 +2,6 @@ import logging
 from abc import abstractmethod
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Callable, List, Optional, Union
-import logging
 
 # pylint: disable=no-name-in-module
 from aioesphomeapi.api_pb2 import (  # type: ignore[attr-defined]
@@ -36,6 +35,7 @@ from .util import call_all
 
 if TYPE_CHECKING:
     from .sendspin_bridge import SendspinBridge
+
 SUPPORTED_MEDIA_PLAYER_FEATURES = (
     MediaPlayerEntityFeature.PLAY
     | MediaPlayerEntityFeature.PAUSE
@@ -126,27 +126,25 @@ class MediaPlayerEntity(ESPHomeEntity):
         sendspin_was_playing = False
 
         if announcement:
-            # For announcements, pause SendSpin (don't stop it) so it can resume after
+            # Pause Sendspin so it can resume after the announcement finishes.
             sendspin_was_playing = self._pause_sendspin_if_playing()
         else:
-            # For music playback, stop SendSpin completely (HA is taking over)
+            # HA is taking over for music, so stop Sendspin entirely.
             self._stop_sendspin_if_playing()
 
         if announcement:
             self._log.debug("PLAY: announcement true")
             if self.music_player.is_playing:
-                # HA music playing: pause it, play announcement, then resume both
                 self.music_player.pause()
                 self.announce_player.play(
                     url,
                     done_callback=lambda: call_all(
                         self.music_player.resume,
-                        self._resume_sendspin if sendspin_was_playing else lambda: None,
+                        self._resume_sendspin if sendspin_was_playing else (lambda: None),
                         done_callback,
                     ),
                 )
             elif sendspin_was_playing:
-                # SendSpin was playing: play announcement, then resume SendSpin
                 self.announce_player.play(
                     url,
                     done_callback=lambda: call_all(
@@ -154,30 +152,21 @@ class MediaPlayerEntity(ESPHomeEntity):
                         lambda: self._safe_send_state(MediaPlayerState.PAUSED),
                         done_callback,
                     ),
-                    done_callback=lambda: call_all(self.music_player.resume, done_callback),
                 )
             else:
-                # Nothing was playing, just announce then go idle
                 self.announce_player.play(
                     url,
                     done_callback=lambda: call_all(
                         lambda: self._safe_send_state(MediaPlayerState.IDLE),
-                        self.server.send_messages([self._update_state(MediaPlayerState.IDLE)]),
                         done_callback,
                     ),
                 )
         else:
-            # Music playback
+            self._log.debug("PLAY: announcement false")
             self.music_player.play(
                 url,
                 done_callback=lambda: call_all(
                     lambda: self._safe_send_state(MediaPlayerState.IDLE),
-            self._log.debug("PLAY: announcement false")
-            # Music
-            self.music_player.play(
-                url,
-                done_callback=lambda: call_all(
-                    self.server.send_messages([self._update_state(MediaPlayerState.IDLE)]),
                     done_callback,
                 ),
             )
