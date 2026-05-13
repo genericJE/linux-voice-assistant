@@ -64,7 +64,7 @@ async def main() -> None:
     )
     parser.add_argument(
         "--audio-output-device",
-        help="Name for the audio output device (see --list-output-devices)",
+        help="Name for the audio output device (see --list-output-devices). SendSpin will auto-match to sounddevice.",
     )
     parser.add_argument(
         "--list-output-devices",
@@ -215,6 +215,22 @@ async def main() -> None:
         action="store_true",
         help="Add this to enable debug logging",
     )
+    #
+    # SendSpin client options
+    parser.add_argument(
+        "--sendspin-url",
+        help="SendSpin server WebSocket URL (e.g., ws://192.168.1.100:8928/sendspin)",
+    )
+    parser.add_argument(
+        "--sendspin-client-id",
+        help="Unique identifier for SendSpin client (default: linux-voice-assistant-<hostname>)",
+    )
+    parser.add_argument(
+        "--sendspin-static-delay-ms",
+        type=float,
+        default=0.0,
+        help="Static playback delay in milliseconds for SendSpin sync adjustment",
+    )
     parser.add_argument(
         "--output-only",
         action="store_true",
@@ -230,6 +246,8 @@ async def main() -> None:
         return
 
     if args.list_output_devices:
+        from .audio_device_util import list_output_devices
+        list_output_devices()
         from mpv import MPV
 
         player = MPV()
@@ -482,6 +500,24 @@ async def main() -> None:
     )
     process_audio_thread.start()
 
+    # Initialize Sendspin bridge if a server URL was provided. The media player
+    # entity already exists because the protocol-init validation above ran the
+    # VoiceSatelliteProtocol constructor.
+    if args.sendspin_url:
+        from .audio_device_util import find_sounddevice_by_name
+        from .sendspin_bridge import SendspinBridge
+
+        sounddevice_index = find_sounddevice_by_name(args.audio_output_device)
+        state.sendspin_bridge = SendspinBridge(
+            media_player_entity=state.media_player_entity,
+            client_id=args.sendspin_client_id,
+            client_name=args.name,
+            static_delay_ms=args.sendspin_static_delay_ms,
+            audio_device=sounddevice_index,
+        )
+        state.media_player_entity.set_sendspin_bridge(state.sendspin_bridge)
+        await state.sendspin_bridge.start(server_url=args.sendspin_url)
+
     # Auto discovery (zeroconf, mDNS)
     discovery = HomeAssistantZeroconf(
         port=args.port,
@@ -519,6 +555,10 @@ async def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        # Stop SendSpin bridge
+        if state.sendspin_bridge:
+            await state.sendspin_bridge.disconnect()
+
         state.audio_queue.put_nowait(None)
         process_audio_thread.join()
         if peripheral_api is not None:
