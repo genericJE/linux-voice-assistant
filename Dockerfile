@@ -22,6 +22,7 @@ LABEL \
 # - pipewire-pulse:     Required for pipewire support
 # - build-essential:    Required to compile pymicro-features
 # - libmpv-dev:         Required by python-mpv for audio playback
+# - libportaudio2:      Required by sounddevice (Sendspin audio output)
 # - libasound2-plugins: Required by python-mpv for audio playback
 # - ca-certificates:    For encrypted connections
 # - iproute2:           For ss command in entrypoint (port check)
@@ -36,6 +37,7 @@ RUN apt-get update && \
     pipewire-pulse \
     build-essential \
     libmpv-dev \
+    libportaudio2 \
     libasound2-plugins \
     ca-certificates \
     iproute2 \
