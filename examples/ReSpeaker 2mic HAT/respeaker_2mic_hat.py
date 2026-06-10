@@ -25,11 +25,11 @@ LED behaviours
 
 On connect the script registers an HA Light entity with LVA via the
 register_light command, exposing a single "Voice Assistant" effect to
-match the HA Voice PE. Like the Voice PE LED Ring, the light defaults
-off: while idle the LEDs hold the user color when it is on and stay
-dark when it is off. The pipeline animations always run regardless,
-tinted by the user color, so turning the light off only removes the
-idle glow; brightness scales every animation.
+match the HA Voice PE. Like the Voice PE ring, the light defaults off:
+the idle LEDs hold the user color when it is on and go dark when it is
+off. The animations always run regardless, tinted by the user color,
+so turning the light off only drops the idle glow. Brightness scales
+every animation.
 
 Button behaviour (context action — same priority as HA Voice PE centre button)
 -------------------------------------------------------------------------------
@@ -158,10 +158,9 @@ class AssistState(str, Enum):
     MEDIA_PLAYING = "media_player_playing"
 
 
-# Effect name. Must match the LEDLightEntity effects list the peripheral
-# registers with LVA via register_light below. Like the HA Voice PE, this
-# example exposes only the pipeline animations, which always run and
-# cannot be switched off from HA.
+# Effect name, matching the effects list registered below. Like the HA
+# Voice PE, the example exposes just this one: the pipeline animations,
+# which always run and can't be switched off from HA.
 EFFECT_VOICE_ASSISTANT = "Voice Assistant"
 
 
@@ -179,10 +178,8 @@ class SharedState:
         self.timer_total_seconds: int = 0
         self.timer_seconds_left: int = 0
         # Light entity state, driven by HA via light_command events.
-        # Defaults match the LEDLightEntity in LVA core so the script
-        # behaves sensibly before the first light_command arrives: off by
-        # default, like the Voice PE LED Ring, so idle stays dark until the
-        # user turns the light on.
+        # Defaults mirror the LEDLightEntity in LVA core: off like the
+        # Voice PE ring, so idle stays dark until the user turns it on.
         self.light_is_on: bool = False
         self.light_brightness: float = 0.66
         self.light_red: float = 0.094
@@ -341,10 +338,9 @@ class LEDAnimator:
         self._current_state: AssistState = AssistState.NOT_READY
 
     def set_state(self, state: AssistState, force: bool = False) -> None:
-        # Pass force=True to bypass the no-op guard so a light_command can
-        # re-render with the new color or brightness even when the assist
-        # state hasn't changed. The light's on/off only gates the idle glow
-        # (see _idle); pipeline animations always run, matching the Voice PE.
+        # force=True skips the guard below so a light_command re-renders
+        # color or brightness even when the assist state is unchanged.
+        # on/off only gates the idle glow (see _idle), never the animations.
         if not force and self._current_state == state:
             return
         self._current_state = state
@@ -431,12 +427,10 @@ class LEDAnimator:
     # ------------------------------------------------------------------
 
     async def _idle(self) -> None:
-        """Resting state, matching the HA Voice PE LED Ring.
-
-        Holds the user's color when the HA light is on and stays dark
-        when it is off (the light defaults off). Pipeline animations run
-        regardless, so turning the light off only removes this idle glow.
-        Renders once; set_state(force=True) re-renders on changes.
+        """Resting state, like the HA Voice PE ring: hold the user color
+        when the light is on, stay dark when it is off. Animations run
+        regardless, so off only drops the idle glow. Renders once;
+        set_state(force=True) re-renders on changes.
         """
         if self._shared.snapshot["light_is_on"]:
             self._leds.set_all(self._user_color())
@@ -933,11 +927,9 @@ class LVAClient:
                 _LOGGER.info("LVA starting up, waiting for HA …")
 
         elif event == "light_command":
-            # LVA broadcasts to every connected peripheral; only act on
-            # commands targeting our registered Light. The Light exposes a
-            # single "Voice Assistant" effect, so there is no effect to
-            # switch on: we apply on/off, brightness, and color and let the
-            # pipeline animations run.
+            # LVA broadcasts to every peripheral, so act only on our Light.
+            # We register one effect, so there's nothing to switch on: just
+            # apply on/off, brightness, and color and let the animations run.
             if data.get("object_id") != LIGHT_OBJECT_ID:
                 return
             self._state.update(

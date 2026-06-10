@@ -648,10 +648,9 @@ class LEDLightEntity(ESPHomeEntity):
         self._supports_rgb = supports_rgb
         self._supports_brightness = supports_brightness
 
-        # Off by default, matching the HA Voice PE LED Ring
-        # (restore_mode RESTORE_DEFAULT_OFF): the resting LEDs stay dark
-        # until the user turns the light on. Voice animations are driven
-        # separately by the peripheral and play regardless.
+        # Off by default, like the HA Voice PE LED Ring: the resting LEDs
+        # stay dark until the user turns the light on. Peripherals drive
+        # their animations separately, so those play while it is off.
         self.is_on: bool = False
         # Match the HA Voice PE LED Ring initial state: a light blue at 66%
         # brightness (red 9.4%, green 73.3%, blue 94.9%).
