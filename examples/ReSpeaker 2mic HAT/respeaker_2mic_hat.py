@@ -11,7 +11,7 @@ Hardware layout
 
 LED behaviours
 --------------
-  idle             : all off
+  idle             : solid user color when the LED light is on, else dark
   wake_word        : brief flash on all 3 LEDs (user color from HA Light entity)
   listening        : chase across the LEDs (user color from HA Light entity)
   thinking         : yellow pulse on all 3 LEDs
@@ -24,10 +24,12 @@ LED behaviours
   not_ready/no_ha  : dim red pulse on all 3 LEDs
 
 On connect the script registers an HA Light entity with LVA via the
-register_light command. Changes from HA flow back as light_command
-events. On/off and brightness scale every animation. The "Loop"
-effect cycles all three LEDs through the HSV color wheel in unison,
-and "None" holds a solid user color and skips pipeline animations.
+register_light command, exposing a single "Voice Assistant" effect to
+match the HA Voice PE. Like the Voice PE LED Ring, the light defaults
+off: while idle the LEDs hold the user color when it is on and stay
+dark when it is off. The pipeline animations always run regardless,
+tinted by the user color, so turning the light off only removes the
+idle glow; brightness scales every animation.
 
 Button behaviour (context action — same priority as HA Voice PE centre button)
 -------------------------------------------------------------------------------
@@ -37,7 +39,7 @@ Button behaviour (context action — same priority as HA Voice PE centre button)
       thinking (pipeline active) /
         tts speaking                → stop_pipeline
     media playing               → stop_media_player
-    idle / anything else        → toggle mute (mute_mic / unmute_mic)
+    idle / anything else        → start_listening
 
   Multi-press (detected via timing):
     double press (< 250ms between releases)  → button_double_press
@@ -66,7 +68,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import colorsys
 import json
 import logging
 import math
@@ -155,17 +156,13 @@ class AssistState(str, Enum):
     TIMER_TICKING = "timer_ticking"
     TIMER_RINGING = "timer_ringing"
     MEDIA_PLAYING = "media_player_playing"
-    # Pseudo-states driven by the HA Light entity (not emitted by LVA).
-    OFF           = "off"     # Light entity is off; all LEDs dark.
-    STATIC        = "static"  # Effect "None": hold the solid user color.
-    LOOP          = "loop"    # Effect "Loop": cycle the LEDs through hues.
 
 
-# Effect names. These must match the LEDLightEntity effects list that
-# the peripheral registers with LVA via register_light below.
+# Effect name. Must match the LEDLightEntity effects list the peripheral
+# registers with LVA via register_light below. Like the HA Voice PE, this
+# example exposes only the pipeline animations, which always run and
+# cannot be switched off from HA.
 EFFECT_VOICE_ASSISTANT = "Voice Assistant"
-EFFECT_LOOP            = "Loop"
-EFFECT_NONE            = "None"
 
 
 # ---------------------------------------------------------------------------
@@ -183,18 +180,29 @@ class SharedState:
         self.timer_seconds_left: int = 0
         # Light entity state, driven by HA via light_command events.
         # Defaults match the LEDLightEntity in LVA core so the script
-        # behaves sensibly before the first light_command arrives.
-        self.light_is_on: bool = True
+        # behaves sensibly before the first light_command arrives: off by
+        # default, like the Voice PE LED Ring, so idle stays dark until the
+        # user turns the light on.
+        self.light_is_on: bool = False
         self.light_brightness: float = 1.0
         self.light_red: float = 0.0
         self.light_green: float = 0.2
         self.light_blue: float = 1.0
-        self.light_effect: str = EFFECT_VOICE_ASSISTANT
+        # Monotonic deadline used by _timer_tick to fade brightness
+        # smoothly between sparse timer_updated events.
+        self.timer_ends_at: float = 0.0
 
     def update(self, **kwargs) -> None:
         with self._lock:
             for key, val in kwargs.items():
                 setattr(self, key, val)
+
+    def set_timer_progress(self, total_seconds: int, seconds_left: int) -> None:
+        """Update timer counters and the monotonic deadline atomically."""
+        with self._lock:
+            self.timer_total_seconds = max(1, int(total_seconds))
+            self.timer_seconds_left = int(seconds_left)
+            self.timer_ends_at = time.monotonic() + max(0, int(seconds_left))
 
     @property
     def snapshot(self) -> dict:
@@ -211,7 +219,7 @@ class SharedState:
                 "light_red":           self.light_red,
                 "light_green":         self.light_green,
                 "light_blue":          self.light_blue,
-                "light_effect":        self.light_effect,
+                "timer_ends_at":       self.timer_ends_at,
             }
 
 
@@ -333,18 +341,10 @@ class LEDAnimator:
         self._current_state: AssistState = AssistState.NOT_READY
 
     def set_state(self, state: AssistState, force: bool = False) -> None:
-        # HA Light entity overrides take precedence over pipeline state.
-        # Pass force=True to bypass the no-op guard so a light_command
-        # can re-render with the new color, brightness, or effect even
-        # when the underlying assist state hasn't changed.
-        snap = self._shared.snapshot
-        if not snap["light_is_on"]:
-            state = AssistState.OFF
-        elif snap["light_effect"] == EFFECT_NONE:
-            state = AssistState.STATIC
-        elif snap["light_effect"] == EFFECT_LOOP:
-            state = AssistState.LOOP
-
+        # Pass force=True to bypass the no-op guard so a light_command can
+        # re-render with the new color or brightness even when the assist
+        # state hasn't changed. The light's on/off only gates the idle glow
+        # (see _idle); pipeline animations always run, matching the Voice PE.
         if not force and self._current_state == state:
             return
         self._current_state = state
@@ -352,16 +352,7 @@ class LEDAnimator:
 
         _LOGGER.debug("LED state → %s", state.value)
 
-        if state == AssistState.OFF:
-            self._leds.off()  # No animation task; LEDs stay dark.
-
-        elif state == AssistState.STATIC:
-            self._task = asyncio.create_task(self._static())
-
-        elif state == AssistState.LOOP:
-            self._task = asyncio.create_task(self._loop())
-
-        elif state == AssistState.IDLE:
+        if state == AssistState.IDLE:
             self._task = asyncio.create_task(self._idle())
 
         elif state == AssistState.NOT_READY:
@@ -440,29 +431,18 @@ class LEDAnimator:
     # ------------------------------------------------------------------
 
     async def _idle(self) -> None:
-        self._leds.off()
+        """Resting state, matching the HA Voice PE LED Ring.
 
-    async def _static(self) -> None:
-        """Hold the user's solid color while the effect is "None".
-
-        Renders once. set_state(force=True) re-renders on changes.
+        Holds the user's color when the HA light is on and stays dark
+        when it is off (the light defaults off). Pipeline animations run
+        regardless, so turning the light off only removes this idle glow.
+        Renders once; set_state(force=True) re-renders on changes.
         """
-        self._leds.set_all(self._user_color())
-        self._leds.show(self._brightness())
-
-    async def _loop(self, period: float = 5.0) -> None:
-        """Cycle all 3 LEDs through the HSV color wheel in unison.
-
-        Every LED shows the same hue at any given moment, so the strip
-        reads as a single shifting color rather than a spread rainbow.
-        period is the time in seconds for one full revolution.
-        """
-        while True:
-            hue = (time.monotonic() / period) % 1.0
-            r, g, b = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
-            self._leds.set_all((int(r * 255), int(g * 255), int(b * 255)))
+        if self._shared.snapshot["light_is_on"]:
+            self._leds.set_all(self._user_color())
             self._leds.show(self._brightness())
-            await asyncio.sleep(0.05)
+        else:
+            self._leds.off()
 
     async def _steady_all(self, color: ColorSource, brightness: float = LED_BRIGHTNESS) -> None:
         self._leds.set_all(_resolve(color))
@@ -538,13 +518,14 @@ class LEDAnimator:
 
     async def _timer_tick(self) -> None:
         """
-        All 3 LEDs dim cyan, brightness proportional to time remaining.
-        Full brightness = full time left; almost off = nearly expired.
+        All 3 LEDs dim cyan with brightness proportional to time remaining,
+        computed from a monotonic deadline so it fades smoothly between
+        sparse timer_updated events.
         """
         while True:
             snap = self._shared.snapshot
             total = max(snap["timer_total_seconds"], 1)
-            left  = snap["timer_seconds_left"]
+            left  = max(0.0, snap["timer_ends_at"] - time.monotonic())
             brightness = max(0.05, min(1.0, left / total))
             self._leds.set_all(CYAN)
             self._leds.show(self._brightness(brightness))
@@ -621,7 +602,7 @@ class ButtonHandler:
           2. Pipeline active            → stop_pipeline
              (wake word / listening / thinking / speaking)
           3. Media playing              → stop_media_player
-          4. Idle / anything else       → toggle mute
+          4. Idle / anything else       → start_listening
         """
         assist = self._state.assist_state
 
@@ -631,10 +612,8 @@ class ButtonHandler:
             self._send("stop_pipeline")
         elif assist == AssistState.MEDIA_PLAYING:
             self._send("stop_media_player")
-        elif self._state.muted:
-            self._send("unmute_mic")
         else:
-            self._send("mute_mic")
+            self._send("start_listening")
 
 
 # ===========================================================================
@@ -803,7 +782,7 @@ class LVAClient:
                 "data": {
                     "name": LIGHT_NAME,
                     "object_id": LIGHT_OBJECT_ID,
-                    "effects": [EFFECT_VOICE_ASSISTANT, EFFECT_LOOP, EFFECT_NONE],
+                    "effects": [EFFECT_VOICE_ASSISTANT],
                     "supports_rgb": True,
                     "supports_brightness": True,
                 },
@@ -872,14 +851,27 @@ class LVAClient:
             self._state.update(assist_state=AssistState.SPEAKING)
 
         elif event in ("tts_finished", "idle"):
-            # Return to muted indicator if still muted, otherwise idle
+            # Pick the indicator that should still be visible. A voice
+            # initiated timer produces this sequence: timer_ticking
+            # (countdown starts) -> tts_speaking (TTS confirms the
+            # timer) -> tts_finished (we land here). Going straight
+            # to IDLE would hide the countdown for the entire run.
             if self._state.muted:
                 self._state.update(assist_state=AssistState.MUTED)
+            elif self._state.timer_ends_at > time.monotonic():
+                self._state.update(assist_state=AssistState.TIMER_TICKING)
             else:
                 self._state.update(assist_state=AssistState.IDLE)
 
         elif event == "muted":
-            self._state.update(assist_state=AssistState.MUTED, muted=True)
+            # Carries the mic mute state in both directions. Default True so a
+            # bare "muted" event (no data) still reads as muted.
+            muted = data.get("muted", True)
+            self._state.update(muted=muted)
+            if muted:
+                self._state.update(assist_state=AssistState.MUTED)
+            elif self._state.assist_state == AssistState.MUTED:
+                self._state.update(assist_state=AssistState.IDLE)
 
         elif event == "pipeline_error":
             _LOGGER.warning("LVA pipeline error: %s", data.get("reason", ""))
@@ -898,24 +890,24 @@ class LVAClient:
             self._animator.set_state(AssistState.NOT_READY)
 
         elif event == "timer_ticking":
-            self._state.update(
-                assist_state=AssistState.TIMER_TICKING,
-                timer_total_seconds=data.get("total_seconds", 0),
-                timer_seconds_left=data.get("seconds_left", 0),
+            self._state.set_timer_progress(
+                data.get("total_seconds", 0),
+                data.get("seconds_left", 0),
             )
+            self._state.update(assist_state=AssistState.TIMER_TICKING)
 
         elif event == "timer_updated":
-            self._state.update(
-                timer_total_seconds=data.get("total_seconds", 0),
-                timer_seconds_left=data.get("seconds_left", 0),
+            self._state.set_timer_progress(
+                data.get("total_seconds", 0),
+                data.get("seconds_left", 0),
             )
 
         elif event == "timer_ringing":
-            self._state.update(
-                assist_state=AssistState.TIMER_RINGING,
-                timer_total_seconds=data.get("total_seconds", 0),
-                timer_seconds_left=data.get("seconds_left", 0),
+            self._state.set_timer_progress(
+                data.get("total_seconds", 0),
+                data.get("seconds_left", 0),
             )
+            self._state.update(assist_state=AssistState.TIMER_RINGING)
 
         elif event == "media_player_playing":
             self._state.update(assist_state=AssistState.MEDIA_PLAYING)
@@ -949,7 +941,10 @@ class LVAClient:
 
         elif event == "light_command":
             # LVA broadcasts to every connected peripheral; only act on
-            # commands targeting our registered Light.
+            # commands targeting our registered Light. The Light exposes a
+            # single "Voice Assistant" effect, so there is no effect to
+            # switch on: we apply on/off, brightness, and color and let the
+            # pipeline animations run.
             if data.get("object_id") != LIGHT_OBJECT_ID:
                 return
             self._state.update(
@@ -958,7 +953,6 @@ class LVAClient:
                 light_red=float(data.get("red", 0.0)),
                 light_green=float(data.get("green", 0.2)),
                 light_blue=float(data.get("blue", 1.0)),
-                light_effect=str(data.get("effect", EFFECT_VOICE_ASSISTANT)),
             )
             self._animator.set_state(self._state.assist_state, force=True)
             return

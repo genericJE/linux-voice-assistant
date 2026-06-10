@@ -36,7 +36,7 @@ Feedback events emitted by LVA
               see a WebSocket connection failure on its end — that is also
               a "disconnected" condition to handle with the same animation.
   idle
-  muted
+  muted                 data: {"muted": true/false}
   timer_ticking   data: {"id": str, "name": str, "total_seconds": int, "seconds_left": int}
   timer_updated   data: {"id": str, "name": str, "total_seconds": int, "seconds_left": int}
   timer_ringing   data: {"id": str, "name": str, "total_seconds": int, "seconds_left": int}
@@ -51,8 +51,9 @@ Feedback events emitted by LVA
               Fires when HA changes a Light entity that a peripheral
               previously registered via register_light. The peripheral
               matches on object_id and applies the new state. The
-              effect "Voice Assistant" runs the pipeline animations;
-              "None" holds a solid user color.
+              effect names are those the peripheral declared at
+              registration; e.g. "Voice Assistant" runs the pipeline
+              animations, "None" holds a solid user color.
 
 Commands accepted from the peripheral container
 ------------------------------------------------
